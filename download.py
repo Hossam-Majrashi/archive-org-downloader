@@ -2,6 +2,7 @@ import os
 import re
 import requests
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 # =========================
 # اختيار اللغة
@@ -66,31 +67,35 @@ TXT = {
 url_input = input(TXT["enter_url"]).strip()
 
 # =========================
-# عدد التحميلات المتزامنة
+# استخراج المعرف
 # =========================
-if AR:
-    print("\nاكتب رقم عدد التحميلات المتزامنة")
-    print("مثال: 8 ")
-else:
-    print("\nEnter simultaneous download count")
-    print("Example: 8 ")
+def extract_identifier(url):
+    path = urlparse(url).path.strip("/")
 
-threads_input = input("Threads: ").strip()
+    if "details/" in path:
+        return path.split("details/")[-1]
 
-if threads_input.isdigit():
-    max_threads = int(threads_input)
-else:
-    max_threads = 8
+    if "download/" in path:
+        parts = path.split("/")
+        return parts[1] if len(parts) > 1 else parts[0]
+
+    return path
+
+identifier = extract_identifier(url_input)
 
 # =========================
-# تجهيز الروابط
+# API
 # =========================
-identifier = url_input.split("/details/")[-1].strip("/")
-
 META = f"https://archive.org/metadata/{identifier}"
 BASE = f"https://archive.org/download/{identifier}"
 
-data = requests.get(META).json()
+r = requests.get(META)
+
+if r.status_code != 200:
+    print("❌ لا يمكن جلب البيانات من archive.org")
+    exit()
+
+data = r.json()
 
 # =========================
 # اسم المجلد
@@ -105,9 +110,8 @@ os.makedirs(folder, exist_ok=True)
 # =========================
 formats = set()
 
-for f in data["files"]:
+for f in data.get("files", []):
     name = f.get("name", "")
-
     if "." in name:
         ext = "." + name.split(".")[-1].lower()
         formats.add(ext)
@@ -118,12 +122,11 @@ formats = sorted(formats)
 # عرض الصيغ
 # =========================
 print(TXT["formats"])
-
 for i, ext in enumerate(formats, 1):
     print(f"{i} - {ext}")
 
 # =========================
-# شرح الإدخال
+# اختيار الصيغ
 # =========================
 if AR:
     print("\nاكتب الأرقام مفصولة بفاصلة مثل: 1,3")
@@ -132,17 +135,12 @@ else:
 
 choice = input("Select: ").strip()
 
-# =========================
-# الصيغ المختارة
-# =========================
 selected_formats = []
 
 for x in choice.split(","):
     x = x.strip()
-
     if x.isdigit():
         idx = int(x) - 1
-
         if 0 <= idx < len(formats):
             selected_formats.append(formats[idx])
 
@@ -157,14 +155,13 @@ print(TXT["selected"], ", ".join(selected_formats))
 # =========================
 files = []
 
-for f in data["files"]:
+for f in data.get("files", []):
     name = f.get("name", "")
 
     if not any(name.lower().endswith(ext) for ext in selected_formats):
         continue
 
     title = f.get("title") or os.path.splitext(name)[0]
-
     clean = re.sub(r'[\\/*?:"<>|]', "", title).strip()
 
     ext = "." + name.split(".")[-1]
@@ -172,7 +169,7 @@ for f in data["files"]:
     files.append((name, clean, ext))
 
 # =========================
-# التحميل
+# التحميل مع Progress Bar بدون مكتبات
 # =========================
 def download(item):
     name, clean, ext = item
@@ -184,18 +181,44 @@ def download(item):
         print(TXT["skip"], clean)
         return
 
-    print(TXT["downloading"], clean)
+    try:
+        r = requests.get(file_url, stream=True, timeout=30)
+        r.raise_for_status()
 
-    r = requests.get(file_url, stream=True)
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
 
-    with open(path, "wb") as f:
-        for chunk in r.iter_content(1024 * 1024):
-            if chunk:
-                f.write(chunk)
+        print(f"\n{TXT['downloading']} {clean}")
+
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 512):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    # ===== Progress Bar =====
+                    if total > 0:
+                        percent = downloaded * 100 // total
+                        bar_len = 20
+                        filled = percent // 5
+                        bar = "█" * filled + "-" * (bar_len - filled)
+
+                        print(
+                            f"\r[{bar}] {percent}% "
+                            f"({downloaded//1024}KB/{total//1024}KB)",
+                            end=""
+                        )
+
+        print(f"\n✔ تم التحميل: {clean}")
+
+    except Exception as e:
+        print(f"\n❌ خطأ في {clean}: {e}")
 
 # =========================
 # بدء التحميل
 # =========================
+max_threads = 8
+
 print(f"{TXT['folder']} {folder}")
 print(f"{TXT['files']} {len(files)}")
 print(f"Threads: {max_threads}\n")

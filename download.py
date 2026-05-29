@@ -1,6 +1,8 @@
 import os
 import re
+import threading
 import requests
+
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
@@ -59,7 +61,27 @@ TXT = {
         "\nاكتمل ✔"
         if AR else
         "\nDone ✔",
+
+    "error":
+        "❌ خطأ:"
+        if AR else
+        "❌ Error:",
+
+    "fetch_error":
+        "❌ لا يمكن جلب البيانات من archive.org"
+        if AR else
+        "❌ Failed to fetch archive.org metadata",
+
+    "choose":
+        "\nاكتب الأرقام مفصولة بفاصلة مثل: 1,3"
+        if AR else
+        "\nEnter numbers separated by commas like: 1,3",
 }
+
+# =========================
+# قفل الطباعة
+# =========================
+print_lock = threading.Lock()
 
 # =========================
 # إدخال الرابط
@@ -70,6 +92,7 @@ url_input = input(TXT["enter_url"]).strip()
 # استخراج المعرف
 # =========================
 def extract_identifier(url):
+
     path = urlparse(url).path.strip("/")
 
     if "details/" in path:
@@ -81,6 +104,7 @@ def extract_identifier(url):
 
     return path
 
+
 identifier = extract_identifier(url_input)
 
 # =========================
@@ -89,19 +113,38 @@ identifier = extract_identifier(url_input)
 META = f"https://archive.org/metadata/{identifier}"
 BASE = f"https://archive.org/download/{identifier}"
 
-r = requests.get(META)
+try:
 
-if r.status_code != 200:
-    print("❌ لا يمكن جلب البيانات من archive.org")
+    r = requests.get(META, timeout=30)
+
+    r.raise_for_status()
+
+    data = r.json()
+
+except Exception as e:
+
+    print(TXT["fetch_error"])
+
+    print(e)
+
     exit()
-
-data = r.json()
 
 # =========================
 # اسم المجلد
 # =========================
-folder = data.get("metadata", {}).get("title", identifier)
-folder = re.sub(r'[\\/*?:"<>|]', "", folder).strip()
+folder = data.get("metadata", {}).get(
+    "title",
+    identifier
+)
+
+folder = re.sub(
+    r'[\\/*?:"<>|]',
+    "",
+    folder
+).strip()
+
+if not folder:
+    folder = identifier
 
 os.makedirs(folder, exist_ok=True)
 
@@ -111,10 +154,23 @@ os.makedirs(folder, exist_ok=True)
 formats = set()
 
 for f in data.get("files", []):
-    name = f.get("name", "")
-    if "." in name:
-        ext = "." + name.split(".")[-1].lower()
-        formats.add(ext)
+
+    name = f.get("name", "").lower()
+
+    if "." not in name:
+        continue
+
+    parts = name.split(".")
+
+    # يسمح فقط بالملفات العادية
+    # video.mp4 ✅
+    # video.ia.mp4 ❌
+    if len(parts) != 2:
+        continue
+
+    ext = "." + parts[-1]
+
+    formats.add(ext)
 
 formats = sorted(formats)
 
@@ -122,33 +178,48 @@ formats = sorted(formats)
 # عرض الصيغ
 # =========================
 print(TXT["formats"])
+
 for i, ext in enumerate(formats, 1):
+
     print(f"{i} - {ext}")
 
 # =========================
 # اختيار الصيغ
 # =========================
-if AR:
-    print("\nاكتب الأرقام مفصولة بفاصلة مثل: 1,3")
-else:
-    print("\nEnter numbers separated by commas like: 1,3")
+print(TXT["choose"])
 
 choice = input("Select: ").strip()
 
 selected_formats = []
 
 for x in choice.split(","):
+
     x = x.strip()
+
     if x.isdigit():
+
         idx = int(x) - 1
+
         if 0 <= idx < len(formats):
-            selected_formats.append(formats[idx])
+
+            selected_formats.append(
+                formats[idx]
+            )
+
+selected_formats = list(
+    set(selected_formats)
+)
 
 if not selected_formats:
+
     print(TXT["invalid"])
+
     exit()
 
-print(TXT["selected"], ", ".join(selected_formats))
+print(
+    TXT["selected"],
+    ", ".join(selected_formats)
+)
 
 # =========================
 # تجهيز الملفات
@@ -156,74 +227,212 @@ print(TXT["selected"], ", ".join(selected_formats))
 files = []
 
 for f in data.get("files", []):
+
     name = f.get("name", "")
 
-    if not any(name.lower().endswith(ext) for ext in selected_formats):
+    if not name:
         continue
 
-    title = f.get("title") or os.path.splitext(name)[0]
-    clean = re.sub(r'[\\/*?:"<>|]', "", title).strip()
+    lower_name = name.lower()
 
-    ext = "." + name.split(".")[-1]
+    if "." not in lower_name:
+        continue
 
-    files.append((name, clean, ext))
+    parts = lower_name.split(".")
+
+    # =========================
+    # منع الملفات المركبة
+    # =========================
+    if len(parts) != 2:
+        continue
+
+    ext = "." + parts[-1]
+
+    # فقط الصيغ المختارة
+    if ext not in selected_formats:
+        continue
+
+    title = (
+        f.get("title")
+        or os.path.splitext(
+            os.path.basename(name)
+        )[0]
+    )
+
+    clean = re.sub(
+        r'[\\/*?:"<>|]',
+        "",
+        title
+    ).strip()
+
+    if not clean:
+
+        clean = os.path.splitext(
+            os.path.basename(name)
+        )[0]
+
+    files.append(
+        (name, clean, ext)
+    )
 
 # =========================
-# التحميل مع Progress Bar بدون مكتبات
+# حذف التكرارات
+# =========================
+unique = {}
+
+for item in files:
+    unique[item[0]] = item
+
+files = list(unique.values())
+
+# =========================
+# التحميل
 # =========================
 def download(item):
+
     name, clean, ext = item
 
     file_url = f"{BASE}/{name}"
-    path = f"{folder}/{clean}{ext}"
 
-    if os.path.exists(path):
-        print(TXT["skip"], clean)
-        return
+    path = os.path.join(
+        folder,
+        clean + ext
+    )
+
+    # =========================
+    # منع تكرار الأسماء
+    # =========================
+    counter = 1
+
+    while os.path.exists(path):
+
+        filename = (
+            f"{clean}_{counter}{ext}"
+        )
+
+        path = os.path.join(
+            folder,
+            filename
+        )
+
+        counter += 1
 
     try:
-        r = requests.get(file_url, stream=True, timeout=30)
+
+        r = requests.get(
+            file_url,
+            stream=True,
+            timeout=30
+        )
+
         r.raise_for_status()
 
-        total = int(r.headers.get("content-length", 0))
+        total = int(
+            r.headers.get(
+                "content-length",
+                0
+            )
+        )
+
         downloaded = 0
 
-        print(f"\n{TXT['downloading']} {clean}")
+        last_percent = -1
+
+        with print_lock:
+
+            print(
+                f"\n{TXT['downloading']} "
+                f"{os.path.basename(path)}"
+            )
 
         with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 512):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
 
-                    # ===== Progress Bar =====
-                    if total > 0:
-                        percent = downloaded * 100 // total
+            for chunk in r.iter_content(
+                chunk_size=1024 * 512
+            ):
+
+                if not chunk:
+                    continue
+
+                f.write(chunk)
+
+                downloaded += len(chunk)
+
+                # =========================
+                # Progress
+                # =========================
+                if total > 0:
+
+                    percent = int(
+                        downloaded * 100 / total
+                    )
+
+                    # تحديث كل 5%
+                    if percent >= last_percent + 5:
+
+                        last_percent = percent
+
                         bar_len = 20
-                        filled = percent // 5
-                        bar = "█" * filled + "-" * (bar_len - filled)
 
-                        print(
-                            f"\r[{bar}] {percent}% "
-                            f"({downloaded//1024}KB/{total//1024}KB)",
-                            end=""
+                        filled = int(
+                            bar_len * percent / 100
                         )
 
-        print(f"\n✔ تم التحميل: {clean}")
+                        bar = (
+                            "█" * filled +
+                            "-" * (
+                                bar_len - filled
+                            )
+                        )
+
+                        with print_lock:
+
+                            print(
+                                f"[{bar}] "
+                                f"{percent}% "
+                                f"- "
+                                f"{os.path.basename(path)}"
+                            )
+
+        with print_lock:
+
+            print(
+                f"✔ اكتمل: "
+                f"{os.path.basename(path)}"
+            )
 
     except Exception as e:
-        print(f"\n❌ خطأ في {clean}: {e}")
+
+        with print_lock:
+
+            print(
+                f"\n{TXT['error']} "
+                f"{clean}"
+            )
+
+            print(e)
 
 # =========================
 # بدء التحميل
 # =========================
 max_threads = 8
 
-print(f"{TXT['folder']} {folder}")
-print(f"{TXT['files']} {len(files)}")
+print(
+    f"{TXT['folder']} "
+    f"{folder}"
+)
+
+print(
+    f"{TXT['files']} "
+    f"{len(files)}"
+)
+
 print(f"Threads: {max_threads}\n")
 
-with ThreadPoolExecutor(max_workers=max_threads) as exe:
+with ThreadPoolExecutor(
+    max_workers=max_threads
+) as exe:
+
     exe.map(download, files)
 
 print(TXT["done"])
